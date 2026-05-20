@@ -2,9 +2,9 @@
 // MySchedule.jsx — Employee's own schedule view
 // ============================================
 import { useState, useEffect } from 'react';
-import { useAuth } from '../../hooks/useAuth';
-import api from '../../utils/api';
-import { ChevronLeft, ChevronRight } from 'lucide-react';
+import { useAuth } from '../hooks/useAuth';
+import api from '../utils/api';
+import { ChevronLeft, ChevronRight, X } from 'lucide-react';
 import { format, startOfWeek, addDays, addWeeks, subWeeks, isSameDay, parseISO } from 'date-fns';
 
 export function MySchedule() {
