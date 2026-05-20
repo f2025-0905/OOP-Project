@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { useAuth } from '../../hooks/useAuth';
-import api from '../../utils/api';
+import { useAuth } from '../hooks/useAuth';
+import api from '../utils/api';
 import { Users, Clock, Umbrella, AlertCircle, TrendingUp } from 'lucide-react';
 import { format } from 'date-fns';
 
