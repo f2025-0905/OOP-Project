@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import api from '../../utils/api';
+import api from '../utils/api';
 import toast from 'react-hot-toast';
 import { Plus, Pencil, Trash2, UserCheck, X, Search } from 'lucide-react';
 
@@ -209,7 +209,6 @@ export default function Staff() {
         </div>
       </div>
 
-      {/* Tabs */}
       <div style={{ display: 'flex', gap: 4, marginBottom: 20, background: 'var(--bg-surface)',
         border: '1px solid var(--border)', borderRadius: 'var(--radius-sm)', padding: 4, width: 'fit-content' }}>
         {['employees','positions'].map(t => (
