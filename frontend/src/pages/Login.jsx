@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { useAuth } from '../../hooks/useAuth';
+import { useAuth } from '../hooks/useAuth';
 import toast from 'react-hot-toast';
 import { Eye, EyeOff, LogIn } from 'lucide-react';
 
@@ -31,7 +31,6 @@ export default function Login() {
 
   return (
     <div className="auth-page">
-      {/* Background orbs */}
       <div className="auth-bg-orb" style={{
         width: 400, height: 400, background: '#4F8EF7',
         top: '-100px', left: '-100px'
