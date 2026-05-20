@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { useAuth } from '../hooks/useAuth';
+import { useAuth } from '../../hooks/useAuth';
 import { LogOut } from 'lucide-react';
 
 const managerLinks = [
@@ -27,7 +27,6 @@ export default function TopNav() {
       <div className="topnav-logo">
         Shift<span>Wise</span>
       </div>
-
       <div className="topnav-links">
         {links.map(link => (
           <Link
@@ -39,7 +38,6 @@ export default function TopNav() {
           </Link>
         ))}
       </div>
-
       <div className="topnav-right">
         <div style={{ textAlign: 'right' }}>
           <div className="user-chip-name">{user?.first_name} {user?.last_name}</div>
