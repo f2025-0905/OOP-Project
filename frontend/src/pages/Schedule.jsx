@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import api from '../../utils/api';
+import api from '../utils/api';
 import toast from 'react-hot-toast';
 import { ChevronLeft, ChevronRight, Plus, Send, X, AlertTriangle } from 'lucide-react';
 import { format, startOfWeek, addDays, addWeeks, subWeeks, isSameDay, parseISO } from 'date-fns';
@@ -101,7 +101,7 @@ export default function Schedule() {
   const [employees, setEmployees]  = useState([]);
   const [positions, setPositions]  = useState([]);
   const [loading,   setLoading]    = useState(true);
-  const [addModal,  setAddModal]   = useState(null); // date object
+  const [addModal,  setAddModal]   = useState(null);
   const [publishing, setPublishing] = useState(false);
 
   const weekDays = getWeekDays(weekStart);
@@ -191,7 +191,6 @@ export default function Schedule() {
       ) : (
         <div className="card" style={{ padding: 0, overflow: 'hidden' }}>
           <div className="schedule-grid">
-            {/* Header row */}
             <div className="schedule-header-cell" style={{ borderRight: '1px solid var(--border)' }}>
               Employee
             </div>
@@ -208,7 +207,6 @@ export default function Schedule() {
               </div>
             ))}
 
-            {/* Employee rows */}
             {employees.map((emp, empIdx) => (
               <>
                 <div key={`emp-${emp.id}`} className="schedule-emp-cell"
