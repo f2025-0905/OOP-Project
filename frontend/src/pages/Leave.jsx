@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
-import { useAuth } from '../../hooks/useAuth';
-import api from '../../utils/api';
+import { useAuth } from '../hooks/useAuth';
+import api from '../utils/api';
 import toast from 'react-hot-toast';
 import { Plus, CheckCircle, XCircle, X } from 'lucide-react';
 import { format, parseISO, differenceInDays } from 'date-fns';
@@ -218,7 +218,6 @@ export default function Leave() {
         )}
       </div>
 
-      {/* Quick stats */}
       <div className="stat-grid" style={{ marginBottom: 20 }}>
         <div className="stat-card">
           <div className="stat-value" style={{ color: 'var(--warning)' }}>{pending}</div>
@@ -241,7 +240,6 @@ export default function Leave() {
           <h2 className="card-title">
             {isManager ? 'All Requests' : 'My Requests'}
           </h2>
-          {/* Filter tabs */}
           <div style={{ display: 'flex', gap: 4, background: 'var(--bg-elevated)',
             borderRadius: 'var(--radius-sm)', padding: 4 }}>
             {['all','pending','approved','rejected'].map(f => (
