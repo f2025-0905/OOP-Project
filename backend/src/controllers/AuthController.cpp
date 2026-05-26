@@ -1,212 +1,156 @@
-#include "controllers/AuthController.h"
-#include "middleware/AuthMiddleware.h"
-#include <bcrypt/BCrypt.hpp>
+#include "../include/controllers/AuthController.h"
+#include "../include/models/User.h"
+#include <crow.h>
 #include <pqxx/pqxx>
+#include <jwt-cpp/jwt.h>
+#include <bcrypt/BCrypt.hpp>
+#include <nlohmann/json.hpp>
 #include <iostream>
+using namespace std;
+using json = nlohmann::json;
 
-crow::response AuthController::login(const crow::request& req) {
+// ─────────────────────────────────────────────
+//  Private helpers
+// ─────────────────────────────────────────────
+
+string AuthController::hashPassword (string plainText) {
+    // BCrypt automatically adds a salt — safe for storing in the DB
+    return BCrypt::generateHash(plainText);
+}
+
+bool AuthController::checkPassword (string plainText, string hash) {
+    return BCrypt::validatePassword(plainText, hash);
+}
+
+string AuthController::createToken (int userId, string role) {
+    // Token expires in 24 hours
+    auto token = jwt::create()
+                     .set_issuer("shiftwise")
+                     .set_type("JWT")
+                     .set_payload_claim("userId", jwt::claim(to_string(userId)))
+                     .set_payload_claim("role",   jwt::claim(role))
+                     .set_expires_at(chrono::system_clock::now() + chrono::hours{24})
+                     .sign(jwt::algorithm::hs256{jwtSecret});
+    return token;
+}
+
+// ─────────────────────────────────────────────
+//  POST /api/auth/signup
+// ─────────────────────────────────────────────
+crow::response AuthController::signup (const crow::request& req) {
     try {
-        auto body = json::parse(req.body);
+        // Parse request body
+        json body = json::parse(req.body);
 
-        if (!body.contains("username") || !body.contains("password")) {
-            return crow::response(400, R"({"error":"Username and password required"})");
+        string name     = body.value("name",     "");
+        string email    = body.value("email",    "");
+        string password = body.value("password", "");
+        string role     = body.value("role",     "employee");
+
+        // Basic validation
+        if (name.empty() || email.empty() || password.empty()) {
+            return crow::response(400, "{\"error\":\"Name, email and password are required\"}");
         }
 
-        std::string username = body["username"].get<std::string>();
-        std::string password = body["password"].get<std::string>();
+        // Connect to database
+        pqxx::connection conn(dbConnection);
+        pqxx::work txn(conn);
 
-        pqxx::work txn(db);
+        // Check if email already exists
+        auto existing = txn.exec_params(
+            "SELECT id FROM users WHERE email = $1",
+            email
+        );
+
+        if (!existing.empty()) {
+            return crow::response(409, "{\"error\":\"Email already registered\"}");
+        }
+
+        // Hash the password before storing
+        string hashedPwd = hashPassword(password);
+
+        // Insert new user into the database
         auto result = txn.exec_params(
-            "SELECT id, username, email, first_name, last_name, role, password_hash, is_active "
-            "FROM users WHERE username = $1 OR email = $1",
-            username
+            "INSERT INTO users (name, email, password, role) "
+            "VALUES ($1, $2, $3, $4) RETURNING id",
+            name, email, hashedPwd, role
+        );
+
+        txn.commit();
+
+        int newId = result[0][0].as<int>();
+
+        // Build User object and generate token
+        User newUser(newId, name, email, hashedPwd, role);
+        string token = createToken(newId, role);
+
+        // Return success response with token
+        json response;
+        response["message"] = "Account created successfully";
+        response["token"]   = token;
+        response["user"]    = json::parse(newUser.toJson());
+
+        return crow::response(201, response.dump());
+
+    } catch (exception& e) {
+        cerr << "Signup error: " << e.what() << endl;
+        return crow::response(500, "{\"error\":\"Internal server error\"}");
+    }
+}
+
+// ─────────────────────────────────────────────
+//  POST /api/auth/login
+// ─────────────────────────────────────────────
+crow::response AuthController::login (const crow::request& req) {
+    try {
+        // Parse request body
+        json body = json::parse(req.body);
+
+        string email    = body.value("email",    "");
+        string password = body.value("password", "");
+
+        if (email.empty() || password.empty()) {
+            return crow::response(400, "{\"error\":\"Email and password are required\"}");
+        }
+
+        // Look up the user in the database
+        pqxx::connection conn(dbConnection);
+        pqxx::work txn(conn);
+
+        auto result = txn.exec_params(
+            "SELECT id, name, email, password, role FROM users WHERE email = $1",
+            email
         );
 
         if (result.empty()) {
-            return crow::response(401, R"({"error":"Invalid credentials"})");
+            return crow::response(401, "{\"error\":\"Invalid email or password\"}");
         }
 
-        auto row = result[0];
-        std::string storedHash = row["password_hash"].as<std::string>();
-        bool isActive = row["is_active"].as<bool>();
+        // Build User object from the DB row
+        int    userId   = result[0][0].as<int>();
+        string userName = result[0][1].as<string>();
+        string userHash = result[0][3].as<string>();
+        string userRole = result[0][4].as<string>();
 
-        if (!isActive) {
-            return crow::response(403, R"({"error":"Account is deactivated"})");
+        // Verify the password
+        if (!checkPassword(password, userHash)) {
+            return crow::response(401, "{\"error\":\"Invalid email or password\"}");
         }
 
-        if (!BCrypt::validatePassword(password, storedHash)) {
-            return crow::response(401, R"({"error":"Invalid credentials"})");
-        }
+        // Create JWT token
+        string token = createToken(userId, userRole);
 
-        std::string userId = row["id"].as<std::string>();
-        std::string role   = row["role"].as<std::string>();
-        std::string token  = AuthMiddleware::generateJWT(userId, role);
+        User loggedIn(userId, userName, email, userHash, userRole);
 
-        json response = {
-            {"token", token},
-            {"user", {
-                {"id",         userId},
-                {"username",   row["username"].as<std::string>()},
-                {"email",      row["email"].as<std::string>()},
-                {"first_name", row["first_name"].as<std::string>()},
-                {"last_name",  row["last_name"].as<std::string>()},
-                {"role",       role}
-            }}
-        };
+        json response;
+        response["message"] = "Login successful";
+        response["token"]   = token;
+        response["user"]    = json::parse(loggedIn.toJson());
 
-        txn.commit();
-        auto res = crow::response(200, response.dump());
-        res.set_header("Content-Type", "application/json");
-        return res;
+        return crow::response(200, response.dump());
 
-    } catch (const std::exception& e) {
-        std::cerr << "Login error: " << e.what() << std::endl;
-        return crow::response(500, R"({"error":"Internal server error"})");
+    } catch (exception& e) {
+        cerr << "Login error: " << e.what() << endl;
+        return crow::response(500, "{\"error\":\"Internal server error\"}");
     }
-}
-
-crow::response AuthController::signup(const crow::request& req) {
-    try {
-        auto body = json::parse(req.body);
-
-        std::vector<std::string> required = {"username","email","password","first_name","last_name"};
-        for (auto& field : required) {
-            if (!body.contains(field) || body[field].get<std::string>().empty()) {
-                return crow::response(400, "{\"error\":\"" + field + " is required\"}");
-            }
-        }
-
-        std::string username   = body["username"].get<std::string>();
-        std::string email      = body["email"].get<std::string>();
-        std::string password   = body["password"].get<std::string>();
-        std::string firstName  = body["first_name"].get<std::string>();
-        std::string lastName   = body["last_name"].get<std::string>();
-
-        if (password.length() < 8) {
-            return crow::response(400, R"({"error":"Password must be at least 8 characters"})");
-        }
-
-        std::string passwordHash = BCrypt::generateHash(password);
-
-        pqxx::work txn(db);
-
-        // Check duplicate
-        auto dupCheck = txn.exec_params(
-            "SELECT id FROM users WHERE username=$1 OR email=$2",
-            username, email
-        );
-        if (!dupCheck.empty()) {
-            return crow::response(409, R"({"error":"Username or email already exists"})");
-        }
-
-        // Insert manager
-        auto result = txn.exec_params(
-            "INSERT INTO users (username, email, password_hash, first_name, last_name, role) "
-            "VALUES ($1, $2, $3, $4, $5, 'manager') RETURNING id",
-            username, email, passwordHash, firstName, lastName
-        );
-
-        std::string userId = result[0]["id"].as<std::string>();
-        std::string token  = AuthMiddleware::generateJWT(userId, "manager");
-
-        txn.commit();
-
-        json response = {
-            {"token", token},
-            {"user", {
-                {"id",         userId},
-                {"username",   username},
-                {"email",      email},
-                {"first_name", firstName},
-                {"last_name",  lastName},
-                {"role",       "manager"}
-            }}
-        };
-
-        auto res = crow::response(201, response.dump());
-        res.set_header("Content-Type", "application/json");
-        return res;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Signup error: " << e.what() << std::endl;
-        return crow::response(500, R"({"error":"Internal server error"})");
-    }
-}
-
-crow::response AuthController::getMe(const crow::request& req) {
-    return AuthMiddleware::requireAuth(req, [&](const AuthContext& ctx) -> crow::response {
-        try {
-            pqxx::work txn(db);
-            auto result = txn.exec_params(
-                "SELECT u.id, u.username, u.email, u.first_name, u.last_name, u.role, u.created_at, "
-                "ep.position_id, ep.leave_balance, p.name as position_name "
-                "FROM users u "
-                "LEFT JOIN employee_profiles ep ON u.id = ep.user_id "
-                "LEFT JOIN positions p ON ep.position_id = p.id "
-                "WHERE u.id = $1",
-                ctx.userId
-            );
-
-            if (result.empty()) {
-                return crow::response(404, R"({"error":"User not found"})");
-            }
-
-            auto row = result[0];
-            json user = {
-                {"id",           row["id"].as<std::string>()},
-                {"username",     row["username"].as<std::string>()},
-                {"email",        row["email"].as<std::string>()},
-                {"first_name",   row["first_name"].as<std::string>()},
-                {"last_name",    row["last_name"].as<std::string>()},
-                {"role",         row["role"].as<std::string>()},
-                {"created_at",   row["created_at"].as<std::string>()}
-            };
-
-            if (!row["position_id"].is_null()) {
-                user["position_id"]   = row["position_id"].as<std::string>();
-                user["position_name"] = row["position_name"].as<std::string>();
-                user["leave_balance"] = row["leave_balance"].as<int>();
-            }
-
-            txn.commit();
-            auto res = crow::response(200, user.dump());
-            res.set_header("Content-Type", "application/json");
-            return res;
-
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
-        }
-    });
-}
-
-crow::response AuthController::changePassword(const crow::request& req) {
-    return AuthMiddleware::requireAuth(req, [&](const AuthContext& ctx) -> crow::response {
-        try {
-            auto body = json::parse(req.body);
-            std::string oldPass = body["old_password"].get<std::string>();
-            std::string newPass = body["new_password"].get<std::string>();
-
-            if (newPass.length() < 8) {
-                return crow::response(400, R"({"error":"New password must be at least 8 characters"})");
-            }
-
-            pqxx::work txn(db);
-            auto result = txn.exec_params(
-                "SELECT password_hash FROM users WHERE id=$1", ctx.userId
-            );
-
-            if (!BCrypt::validatePassword(oldPass, result[0]["password_hash"].as<std::string>())) {
-                return crow::response(401, R"({"error":"Incorrect current password"})");
-            }
-
-            std::string newHash = BCrypt::generateHash(newPass);
-            txn.exec_params("UPDATE users SET password_hash=$1 WHERE id=$2", newHash, ctx.userId);
-            txn.commit();
-
-            return crow::response(200, R"({"message":"Password updated successfully"})");
-
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
-        }
-    });
 }

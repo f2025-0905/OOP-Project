@@ -1,247 +1,231 @@
-#include "controllers/Controllers.h"
-#include "middleware/AuthMiddleware.h"
+#include "../include/middleware/AuthMiddleware.h"
+#include "../include/models/Shift.h"
+#include <crow.h>
 #include <pqxx/pqxx>
+#include <nlohmann/json.hpp>
 #include <iostream>
+using namespace std;
+using json = nlohmann::json;
 
-bool ScheduleController::hasLeaveConflict(const std::string& employeeId,
-                                           const std::string& shiftDate) {
-    pqxx::work txn(db);
-    auto result = txn.exec_params(
-        "SELECT id FROM leave_requests "
-        "WHERE employee_id=$1 AND status='approved' "
-        "AND $2::date BETWEEN start_date AND end_date",
-        employeeId, shiftDate
-    );
-    return !result.empty();
-}
+// ─────────────────────────────────────────────
+//  ScheduleController  —  /api/schedule routes
+//
+//  GET    /api/schedule          — all shifts (manager)
+//  GET    /api/schedule/my       — employee's own shifts
+//  POST   /api/schedule          — create a shift (manager)
+//  PUT    /api/schedule/:id      — update a shift (manager)
+//  DELETE /api/schedule/:id      — delete a shift (manager)
+// ─────────────────────────────────────────────
+class ScheduleController {
+private:
+    string         dbConnection;
+    AuthMiddleware authMiddleware;
 
-crow::response ScheduleController::getWeeklySchedule(const crow::request& req) {
-    return AuthMiddleware::requireManager(req, [&](const AuthContext& ctx) -> crow::response {
+    // Read userId from JWT payload
+    int getUserIdFromToken (const crow::request& req) {
+        string token = authMiddleware.extractToken(req);
+        if (token.empty()) return -1;
         try {
-            std::string weekStart = req.url_params.get("week") ? req.url_params.get("week") : "";
-            if (weekStart.empty()) {
-                return crow::response(400, R"({"error":"week parameter required (YYYY-MM-DD)"})");
-            }
+            auto decoded = jwt::decode(token);
+            return stoi(decoded.get_payload_claim("userId").as_string());
+        } catch (...) {
+            return -1;
+        }
+    }
 
-            pqxx::work txn(db);
-            auto result = txn.exec_params(
-                "SELECT s.id, s.shift_date, s.start_time, s.end_time, s.status, s.notes, "
-                "u.id as emp_id, u.first_name, u.last_name, "
-                "p.id as pos_id, p.name as pos_name, p.color as pos_color "
+public:
+    // Constructor
+    ScheduleController (string connStr, string jwtSecret)
+        : authMiddleware(jwtSecret) {
+        dbConnection = connStr;
+    }
+
+    // ── GET /api/schedule ─────────────────────
+    // Manager sees the full schedule
+    crow::response getAllShifts (const crow::request& req) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isManager(token)) {
+            return crow::response(403, "{\"error\":\"Manager access required\"}");
+        }
+
+        try {
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
+
+            auto rows = txn.exec(
+                "SELECT s.id, u.name, s.date, s.start_time, s.end_time, s.status "
                 "FROM shifts s "
-                "JOIN users u ON s.employee_id = u.id "
-                "LEFT JOIN positions p ON s.position_id = p.id "
-                "WHERE s.shift_date BETWEEN $1::date AND ($1::date + interval '6 days') "
-                "ORDER BY s.shift_date ASC, s.start_time ASC",
-                weekStart
+                "JOIN users u ON s.user_id = u.id "
+                "ORDER BY s.date, s.start_time"
             );
 
-            json shifts = json::array();
-            for (auto& row : result) {
-                shifts.push_back({
-                    {"id",         row["id"].as<std::string>()},
-                    {"shift_date", row["shift_date"].as<std::string>()},
-                    {"start_time", row["start_time"].as<std::string>()},
-                    {"end_time",   row["end_time"].as<std::string>()},
-                    {"status",     row["status"].as<std::string>()},
-                    {"notes",      row["notes"].is_null() ? "" : row["notes"].as<std::string>()},
-                    {"employee", {
-                        {"id",         row["emp_id"].as<std::string>()},
-                        {"first_name", row["first_name"].as<std::string>()},
-                        {"last_name",  row["last_name"].as<std::string>()}
-                    }},
-                    {"position", row["pos_id"].is_null() ? nullptr : json({
-                        {"id",    row["pos_id"].as<std::string>()},
-                        {"name",  row["pos_name"].as<std::string>()},
-                        {"color", row["pos_color"].as<std::string>()}
-                    })}
-                });
+            json list = json::array();
+            for (auto& row : rows) {
+                json shift;
+                shift["id"]        = row[0].as<int>();
+                shift["staffName"] = row[1].as<string>();
+                shift["date"]      = row[2].as<string>();
+                shift["startTime"] = row[3].as<string>();
+                shift["endTime"]   = row[4].as<string>();
+                shift["status"]    = row[5].as<string>();
+                list.push_back(shift);
             }
 
-            txn.commit();
-            auto res = crow::response(200, shifts.dump());
-            res.set_header("Content-Type", "application/json");
-            return res;
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
+            return crow::response(200, list.dump());
+
+        } catch (exception& e) {
+            cerr << "getAllShifts error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
         }
-    });
-}
+    }
 
-crow::response ScheduleController::createShift(const crow::request& req) {
-    return AuthMiddleware::requireManager(req, [&](const AuthContext& ctx) -> crow::response {
+    // ── GET /api/schedule/my ──────────────────
+    // Employee sees only their own upcoming shifts
+    crow::response getMyShifts (const crow::request& req) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isAuthenticated(token)) {
+            return crow::response(401, "{\"error\":\"Please log in first\"}");
+        }
+
+        int userId = getUserIdFromToken(req);
+        if (userId < 0) {
+            return crow::response(401, "{\"error\":\"Invalid token\"}");
+        }
+
         try {
-            auto body = json::parse(req.body);
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
 
-            std::string employeeId = body["employee_id"].get<std::string>();
-            std::string shiftDate  = body["shift_date"].get<std::string>();
-            std::string startTime  = body["start_time"].get<std::string>();
-            std::string endTime    = body["end_time"].get<std::string>();
-            std::string positionId = body.value("position_id", "");
-            std::string notes      = body.value("notes", "");
-
-            // Conflict check
-            if (hasLeaveConflict(employeeId, shiftDate)) {
-                return crow::response(409,
-                    R"({"error":"Employee has approved leave on this date","conflict":"leave"})");
-            }
-
-            pqxx::work txn(db);
-            auto result = txn.exec_params(
-                "INSERT INTO shifts (employee_id, position_id, shift_date, start_time, end_time, notes, created_by) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
-                employeeId,
-                positionId.empty() ? nullptr : &positionId,
-                shiftDate, startTime, endTime,
-                notes.empty() ? nullptr : &notes,
-                ctx.userId
+            auto rows = txn.exec_params(
+                "SELECT id, date, start_time, end_time, status "
+                "FROM shifts WHERE user_id = $1 "
+                "ORDER BY date, start_time",
+                userId
             );
 
-            json response = {
-                {"id",      result[0]["id"].as<std::string>()},
-                {"message", "Shift created"}
-            };
-
-            txn.commit();
-            auto res = crow::response(201, response.dump());
-            res.set_header("Content-Type", "application/json");
-            return res;
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
-        }
-    });
-}
-
-crow::response ScheduleController::updateShift(const crow::request& req, std::string id) {
-    return AuthMiddleware::requireManager(req, [&](const AuthContext& ctx) -> crow::response {
-        try {
-            auto body = json::parse(req.body);
-            pqxx::work txn(db);
-
-            // Only draft shifts can be edited
-            auto check = txn.exec_params("SELECT status FROM shifts WHERE id=$1", id);
-            if (check.empty()) return crow::response(404, R"({"error":"Shift not found"})");
-            if (check[0]["status"].as<std::string>() == "published") {
-                return crow::response(403, R"({"error":"Cannot edit a published shift"})");
+            json list = json::array();
+            for (auto& row : rows) {
+                json shift;
+                shift["id"]        = row[0].as<int>();
+                shift["date"]      = row[1].as<string>();
+                shift["startTime"] = row[2].as<string>();
+                shift["endTime"]   = row[3].as<string>();
+                shift["status"]    = row[4].as<string>();
+                list.push_back(shift);
             }
+
+            return crow::response(200, list.dump());
+
+        } catch (exception& e) {
+            cerr << "getMyShifts error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
+        }
+    }
+
+    // ── POST /api/schedule ────────────────────
+    // Manager creates a new shift
+    // Body: { userId, date, startTime, endTime }
+    crow::response createShift (const crow::request& req) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isManager(token)) {
+            return crow::response(403, "{\"error\":\"Manager access required\"}");
+        }
+
+        try {
+            json body = json::parse(req.body);
+
+            int    userId    = body.value("userId",    0);
+            string date      = body.value("date",      "");
+            string startTime = body.value("startTime", "");
+            string endTime   = body.value("endTime",   "");
+
+            if (userId == 0 || date.empty() || startTime.empty() || endTime.empty()) {
+                return crow::response(400, "{\"error\":\"userId, date, startTime and endTime are required\"}");
+            }
+
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
 
             txn.exec_params(
-                "UPDATE shifts SET "
-                "start_time  = COALESCE(NULLIF($1,'')::time, start_time), "
-                "end_time    = COALESCE(NULLIF($2,'')::time, end_time), "
-                "notes       = $3 "
-                "WHERE id=$4",
-                body.value("start_time",""), body.value("end_time",""),
-                body.value("notes",""), id
+                "INSERT INTO shifts (user_id, date, start_time, end_time, status) "
+                "VALUES ($1, $2, $3, $4, 'scheduled')",
+                userId, date, startTime, endTime
             );
 
             txn.commit();
-            return crow::response(200, R"({"message":"Shift updated"})");
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
+            return crow::response(201, "{\"message\":\"Shift created successfully\"}");
+
+        } catch (exception& e) {
+            cerr << "createShift error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
         }
-    });
-}
+    }
 
-crow::response ScheduleController::deleteShift(const crow::request& req, std::string id) {
-    return AuthMiddleware::requireManager(req, [&](const AuthContext& ctx) -> crow::response {
-        try {
-            pqxx::work txn(db);
-            txn.exec_params("DELETE FROM shifts WHERE id=$1", id);
-            txn.commit();
-            return crow::response(200, R"({"message":"Shift deleted"})");
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
+    // ── PUT /api/schedule/:id ─────────────────
+    // Manager updates an existing shift
+    crow::response updateShift (const crow::request& req, int shiftId) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isManager(token)) {
+            return crow::response(403, "{\"error\":\"Manager access required\"}");
         }
-    });
-}
 
-crow::response ScheduleController::publishShifts(const crow::request& req) {
-    return AuthMiddleware::requireManager(req, [&](const AuthContext& ctx) -> crow::response {
         try {
-            auto body = json::parse(req.body);
-            std::string weekStart = body["week_start"].get<std::string>();
+            json body = json::parse(req.body);
 
-            pqxx::work txn(db);
+            string date      = body.value("date",      "");
+            string startTime = body.value("startTime", "");
+            string endTime   = body.value("endTime",   "");
+            string status    = body.value("status",    "scheduled");
+
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
+
             auto result = txn.exec_params(
-                "UPDATE shifts SET status='published' "
-                "WHERE status='draft' "
-                "AND shift_date BETWEEN $1::date AND ($1::date + interval '6 days') "
-                "RETURNING id",
-                weekStart
+                "UPDATE shifts SET date=$1, start_time=$2, end_time=$3, status=$4 "
+                "WHERE id=$5 RETURNING id",
+                date, startTime, endTime, status, shiftId
             );
 
-            json response = {
-                {"published_count", (int)result.size()},
-                {"message", "Shifts published successfully"}
-            };
+            if (result.empty()) {
+                return crow::response(404, "{\"error\":\"Shift not found\"}");
+            }
 
             txn.commit();
-            auto res = crow::response(200, response.dump());
-            res.set_header("Content-Type", "application/json");
-            return res;
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
-        }
-    });
-}
+            return crow::response(200, "{\"message\":\"Shift updated successfully\"}");
 
-crow::response ScheduleController::getMyShifts(const crow::request& req) {
-    return AuthMiddleware::requireAuth(req, [&](const AuthContext& ctx) -> crow::response {
+        } catch (exception& e) {
+            cerr << "updateShift error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
+        }
+    }
+
+    // ── DELETE /api/schedule/:id ──────────────
+    // Manager removes a shift
+    crow::response deleteShift (const crow::request& req, int shiftId) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isManager(token)) {
+            return crow::response(403, "{\"error\":\"Manager access required\"}");
+        }
+
         try {
-            std::string weekStart = req.url_params.get("week") ? req.url_params.get("week") : "";
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
 
-            pqxx::work txn(db);
-            pqxx::result result;
+            auto result = txn.exec_params(
+                "DELETE FROM shifts WHERE id = $1 RETURNING id",
+                shiftId
+            );
 
-            if (!weekStart.empty()) {
-                result = txn.exec_params(
-                    "SELECT s.id, s.shift_date, s.start_time, s.end_time, s.status, s.notes, "
-                    "p.name as pos_name, p.color as pos_color "
-                    "FROM shifts s "
-                    "LEFT JOIN positions p ON s.position_id = p.id "
-                    "WHERE s.employee_id=$1 AND s.status='published' "
-                    "AND s.shift_date BETWEEN $2::date AND ($2::date + interval '6 days') "
-                    "ORDER BY s.shift_date ASC, s.start_time ASC",
-                    ctx.userId, weekStart
-                );
-            } else {
-                result = txn.exec_params(
-                    "SELECT s.id, s.shift_date, s.start_time, s.end_time, s.status, s.notes, "
-                    "p.name as pos_name, p.color as pos_color "
-                    "FROM shifts s "
-                    "LEFT JOIN positions p ON s.position_id = p.id "
-                    "WHERE s.employee_id=$1 AND s.status='published' "
-                    "AND s.shift_date >= CURRENT_DATE "
-                    "ORDER BY s.shift_date ASC LIMIT 14",
-                    ctx.userId
-                );
-            }
-
-            json shifts = json::array();
-            for (auto& row : result) {
-                json s = {
-                    {"id",         row["id"].as<std::string>()},
-                    {"shift_date", row["shift_date"].as<std::string>()},
-                    {"start_time", row["start_time"].as<std::string>()},
-                    {"end_time",   row["end_time"].as<std::string>()},
-                    {"notes",      row["notes"].is_null() ? "" : row["notes"].as<std::string>()}
-                };
-                if (!row["pos_name"].is_null()) {
-                    s["position"] = {
-                        {"name",  row["pos_name"].as<std::string>()},
-                        {"color", row["pos_color"].as<std::string>()}
-                    };
-                }
-                shifts.push_back(s);
+            if (result.empty()) {
+                return crow::response(404, "{\"error\":\"Shift not found\"}");
             }
 
             txn.commit();
-            auto res = crow::response(200, shifts.dump());
-            res.set_header("Content-Type", "application/json");
-            return res;
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
+            return crow::response(200, "{\"message\":\"Shift deleted successfully\"}");
+
+        } catch (exception& e) {
+            cerr << "deleteShift error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
         }
-    });
-}
+    }
+};

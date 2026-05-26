@@ -1,34 +1,44 @@
-#pragma once
+#ifndef AUTH_CONTROLLER_H
+#define AUTH_CONTROLLER_H
+
 #include <crow.h>
 #include <pqxx/pqxx>
 #include <string>
-#include <nlohmann/json.hpp>
+using namespace std;
 
-using json = nlohmann::json;
-
+// ─────────────────────────────────────────────
+//  AuthController  —  handles /api/auth routes
+//   POST /api/auth/signup
+//   POST /api/auth/login
+// ─────────────────────────────────────────────
 class AuthController {
 private:
-    pqxx::connection& db;
+    string dbConnection;   // PostgreSQL connection string
+    string jwtSecret;      // secret used to sign JWT tokens
 
-    std::string hashPassword(const std::string& password);
-    bool verifyPassword(const std::string& password, const std::string& hash);
-    std::string generateToken(const std::string& userId, const std::string& role);
+    // Hash a plain password using a simple method (bcrypt wrapper)
+    string hashPassword (string plainText) ;
+
+    // Compare a plain password with a stored hash
+    bool checkPassword (string plainText, string hash) ;
+
+    // Create a signed JWT for the given user id and role
+    string createToken (int userId, string role) ;
 
 public:
-    explicit AuthController(pqxx::connection& conn) : db(conn) {}
+    // Constructor — inject DB connection string and JWT secret
+    AuthController (string connStr, string secret) {
+        dbConnection = connStr;
+        jwtSecret    = secret;
+    }
 
-    // POST /api/auth/login
-    crow::response login(const crow::request& req);
+    // Register a new user account
+    // Expects JSON body: { name, email, password, role }
+    crow::response signup (const crow::request& req) ;
 
-    // POST /api/auth/signup  (managers only)
-    crow::response signup(const crow::request& req);
-
-    // POST /api/auth/logout
-    crow::response logout(const crow::request& req);
-
-    // GET /api/auth/me
-    crow::response getMe(const crow::request& req);
-
-    // POST /api/auth/change-password
-    crow::response changePassword(const crow::request& req);
+    // Login with email + password, returns JWT on success
+    // Expects JSON body: { email, password }
+    crow::response login (const crow::request& req) ;
 };
+
+#endif // AUTH_CONTROLLER_H

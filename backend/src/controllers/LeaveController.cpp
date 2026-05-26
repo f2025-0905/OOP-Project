@@ -1,266 +1,228 @@
-#include "controllers/Controllers.h"
-#include "middleware/AuthMiddleware.h"
+#include "../include/middleware/AuthMiddleware.h"
+#include <crow.h>
 #include <pqxx/pqxx>
+#include <nlohmann/json.hpp>
 #include <iostream>
-#include <ctime>
+using namespace std;
+using json = nlohmann::json;
 
-int LeaveController::calculateWorkingDays(const std::string& startDate,
-                                           const std::string& endDate) {
-    // Simple inclusive day count (can enhance for weekday-only logic)
-    // Using DB for accuracy
-    return 1; // placeholder; actual calc done in DB query below
-}
+// ─────────────────────────────────────────────
+//  LeaveController  —  handles /api/leave routes
+//
+//  GET  /api/leave             — all leave requests (manager)
+//  GET  /api/leave/my          — own leave requests (employee)
+//  POST /api/leave             — submit a new leave request
+//  PUT  /api/leave/:id/approve — approve a request (manager)
+//  PUT  /api/leave/:id/reject  — reject  a request (manager)
+// ─────────────────────────────────────────────
+class LeaveController {
+private:
+    string         dbConnection;
+    AuthMiddleware authMiddleware;
 
-void LeaveController::markShiftsAsLeave(const std::string& employeeId,
-                                         const std::string& startDate,
-                                         const std::string& endDate,
-                                         pqxx::work& txn) {
-    // When leave is approved, remove draft shifts in that range
-    txn.exec_params(
-        "DELETE FROM shifts "
-        "WHERE employee_id=$1 AND status='draft' "
-        "AND shift_date BETWEEN $2::date AND $3::date",
-        employeeId, startDate, endDate
-    );
-}
+    // Get the user id stored inside the JWT
+    int getUserIdFromToken (const crow::request& req) {
+        string token = authMiddleware.extractToken(req);
+        if (token.empty()) return -1;
 
-crow::response LeaveController::applyLeave(const crow::request& req) {
-    return AuthMiddleware::requireAuth(req, [&](const AuthContext& ctx) -> crow::response {
         try {
-            auto body = json::parse(req.body);
-
-            std::string startDate = body["start_date"].get<std::string>();
-            std::string endDate   = body["end_date"].get<std::string>();
-            std::string leaveType = body.value("leave_type", "annual");
-            std::string reason    = body.value("reason", "");
-
-            pqxx::work txn(db);
-
-            // Check leave balance for annual leave
-            if (leaveType == "annual") {
-                auto balRes = txn.exec_params(
-                    "SELECT leave_balance FROM employee_profiles WHERE user_id=$1", ctx.userId
-                );
-                if (!balRes.empty()) {
-                    int balance = balRes[0]["leave_balance"].as<int>();
-
-                    auto daysRes = txn.exec_params(
-                        "SELECT ($2::date - $1::date + 1) as days",
-                        startDate, endDate
-                    );
-                    int days = daysRes[0]["days"].as<int>();
-
-                    if (days > balance) {
-                        return crow::response(400,
-                            "{\"error\":\"Insufficient leave balance. You have " +
-                            std::to_string(balance) + " days remaining\"}");
-                    }
-                }
-            }
-
-            // Check for overlapping pending/approved requests
-            auto overlap = txn.exec_params(
-                "SELECT id FROM leave_requests "
-                "WHERE employee_id=$1 AND status IN ('pending','approved') "
-                "AND NOT (end_date < $2::date OR start_date > $3::date)",
-                ctx.userId, startDate, endDate
-            );
-            if (!overlap.empty()) {
-                return crow::response(409, R"({"error":"You already have a leave request for this period"})");
-            }
-
-            auto result = txn.exec_params(
-                "INSERT INTO leave_requests (employee_id, start_date, end_date, leave_type, reason) "
-                "VALUES ($1,$2,$3,$4,$5) RETURNING id, created_at",
-                ctx.userId, startDate, endDate, leaveType, reason
-            );
-
-            txn.commit();
-
-            json response = {
-                {"id",         result[0]["id"].as<std::string>()},
-                {"start_date", startDate},
-                {"end_date",   endDate},
-                {"leave_type", leaveType},
-                {"status",     "pending"},
-                {"message",    "Leave request submitted"}
-            };
-
-            auto res = crow::response(201, response.dump());
-            res.set_header("Content-Type", "application/json");
-            return res;
-
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
+            auto decoded = jwt::decode(token);
+            return stoi(decoded.get_payload_claim("userId").as_string());
+        } catch (...) {
+            return -1;
         }
-    });
-}
+    }
 
-crow::response LeaveController::getMyLeaves(const crow::request& req) {
-    return AuthMiddleware::requireAuth(req, [&](const AuthContext& ctx) -> crow::response {
+public:
+    // Constructor
+    LeaveController (string connStr, string jwtSecret)
+        : authMiddleware(jwtSecret) {
+        dbConnection = connStr;
+    }
+
+    // ── GET /api/leave ────────────────────────
+    // Manager sees all leave requests
+    crow::response getAllLeave (const crow::request& req) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isManager(token)) {
+            return crow::response(403, "{\"error\":\"Manager access required\"}");
+        }
+
         try {
-            pqxx::work txn(db);
-            auto result = txn.exec_params(
-                "SELECT lr.id, lr.start_date, lr.end_date, lr.leave_type, lr.reason, "
-                "lr.status, lr.created_at, lr.reviewed_at, "
-                "u.first_name as reviewer_first, u.last_name as reviewer_last "
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
+
+            auto rows = txn.exec(
+                "SELECT lr.id, u.name, lr.start_date, lr.end_date, "
+                "       lr.reason, lr.status "
                 "FROM leave_requests lr "
-                "LEFT JOIN users u ON lr.reviewed_by = u.id "
-                "WHERE lr.employee_id=$1 "
-                "ORDER BY lr.created_at DESC",
-                ctx.userId
+                "JOIN users u ON lr.user_id = u.id "
+                "ORDER BY lr.created_at DESC"
             );
 
-            json leaves = json::array();
-            for (auto& row : result) {
-                json lr = {
-                    {"id",         row["id"].as<std::string>()},
-                    {"start_date", row["start_date"].as<std::string>()},
-                    {"end_date",   row["end_date"].as<std::string>()},
-                    {"leave_type", row["leave_type"].as<std::string>()},
-                    {"reason",     row["reason"].is_null() ? "" : row["reason"].as<std::string>()},
-                    {"status",     row["status"].as<std::string>()},
-                    {"created_at", row["created_at"].as<std::string>()}
-                };
-                if (!row["reviewer_first"].is_null()) {
-                    lr["reviewed_by"] = row["reviewer_first"].as<std::string>() + " "
-                                       + row["reviewer_last"].as<std::string>();
-                    lr["reviewed_at"] = row["reviewed_at"].as<std::string>();
-                }
-                leaves.push_back(lr);
+            json list = json::array();
+            for (auto& row : rows) {
+                json req_obj;
+                req_obj["id"]        = row[0].as<int>();
+                req_obj["staffName"] = row[1].as<string>();
+                req_obj["startDate"] = row[2].as<string>();
+                req_obj["endDate"]   = row[3].as<string>();
+                req_obj["reason"]    = row[4].as<string>();
+                req_obj["status"]    = row[5].as<string>();
+                list.push_back(req_obj);
             }
 
-            txn.commit();
-            auto res = crow::response(200, leaves.dump());
-            res.set_header("Content-Type", "application/json");
-            return res;
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
+            return crow::response(200, list.dump());
+
+        } catch (exception& e) {
+            cerr << "getAllLeave error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
         }
-    });
-}
+    }
 
-crow::response LeaveController::getAllLeaves(const crow::request& req) {
-    return AuthMiddleware::requireManager(req, [&](const AuthContext& ctx) -> crow::response {
-        try {
-            std::string status = req.url_params.get("status") ? req.url_params.get("status") : "all";
-
-            pqxx::work txn(db);
-            pqxx::result result;
-
-            if (status == "all") {
-                result = txn.exec(
-                    "SELECT lr.id, lr.start_date, lr.end_date, lr.leave_type, lr.reason, "
-                    "lr.status, lr.created_at, "
-                    "u.id as emp_id, u.first_name, u.last_name, u.email "
-                    "FROM leave_requests lr "
-                    "JOIN users u ON lr.employee_id = u.id "
-                    "ORDER BY CASE lr.status WHEN 'pending' THEN 0 ELSE 1 END, lr.created_at DESC"
-                );
-            } else {
-                result = txn.exec_params(
-                    "SELECT lr.id, lr.start_date, lr.end_date, lr.leave_type, lr.reason, "
-                    "lr.status, lr.created_at, "
-                    "u.id as emp_id, u.first_name, u.last_name, u.email "
-                    "FROM leave_requests lr "
-                    "JOIN users u ON lr.employee_id = u.id "
-                    "WHERE lr.status=$1 ORDER BY lr.created_at DESC",
-                    status
-                );
-            }
-
-            json leaves = json::array();
-            for (auto& row : result) {
-                leaves.push_back({
-                    {"id",         row["id"].as<std::string>()},
-                    {"start_date", row["start_date"].as<std::string>()},
-                    {"end_date",   row["end_date"].as<std::string>()},
-                    {"leave_type", row["leave_type"].as<std::string>()},
-                    {"reason",     row["reason"].is_null() ? "" : row["reason"].as<std::string>()},
-                    {"status",     row["status"].as<std::string>()},
-                    {"created_at", row["created_at"].as<std::string>()},
-                    {"employee", {
-                        {"id",         row["emp_id"].as<std::string>()},
-                        {"first_name", row["first_name"].as<std::string>()},
-                        {"last_name",  row["last_name"].as<std::string>()},
-                        {"email",      row["email"].as<std::string>()}
-                    }}
-                });
-            }
-
-            txn.commit();
-            auto res = crow::response(200, leaves.dump());
-            res.set_header("Content-Type", "application/json");
-            return res;
-        } catch (const std::exception& e) {
-            return crow::response(500, R"({"error":"Internal server error"})");
+    // ── GET /api/leave/my ─────────────────────
+    // Employee sees only their own requests
+    crow::response getMyLeave (const crow::request& req) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isAuthenticated(token)) {
+            return crow::response(401, "{\"error\":\"Please log in first\"}");
         }
-    });
-}
 
-crow::response LeaveController::reviewLeave(const crow::request& req, std::string id) {
-    return AuthMiddleware::requireManager(req, [&](const AuthContext& ctx) -> crow::response {
+        int userId = getUserIdFromToken(req);
+        if (userId < 0) {
+            return crow::response(401, "{\"error\":\"Invalid token\"}");
+        }
+
         try {
-            auto body = json::parse(req.body);
-            std::string action = body["action"].get<std::string>(); // "approve" or "reject"
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
 
-            if (action != "approve" && action != "reject") {
-                return crow::response(400, R"({"error":"Action must be 'approve' or 'reject'"})");
-            }
-
-            pqxx::work txn(db);
-
-            auto leaveRes = txn.exec_params(
-                "SELECT employee_id, start_date, end_date, leave_type, status "
-                "FROM leave_requests WHERE id=$1",
-                id
+            auto rows = txn.exec_params(
+                "SELECT id, start_date, end_date, reason, status "
+                "FROM leave_requests WHERE user_id = $1 "
+                "ORDER BY created_at DESC",
+                userId
             );
 
-            if (leaveRes.empty()) return crow::response(404, R"({"error":"Leave request not found"})");
-            if (leaveRes[0]["status"].as<std::string>() != "pending") {
-                return crow::response(409, R"({"error":"Leave request already reviewed"})");
+            json list = json::array();
+            for (auto& row : rows) {
+                json entry;
+                entry["id"]        = row[0].as<int>();
+                entry["startDate"] = row[1].as<string>();
+                entry["endDate"]   = row[2].as<string>();
+                entry["reason"]    = row[3].as<string>();
+                entry["status"]    = row[4].as<string>();
+                list.push_back(entry);
             }
 
-            std::string employeeId = leaveRes[0]["employee_id"].as<std::string>();
-            std::string startDate  = leaveRes[0]["start_date"].as<std::string>();
-            std::string endDate    = leaveRes[0]["end_date"].as<std::string>();
-            std::string leaveType  = leaveRes[0]["leave_type"].as<std::string>();
+            return crow::response(200, list.dump());
 
-            std::string newStatus = (action == "approve") ? "approved" : "rejected";
+        } catch (exception& e) {
+            cerr << "getMyLeave error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
+        }
+    }
+
+    // ── POST /api/leave ───────────────────────
+    // Employee submits a new leave request
+    // Body: { startDate, endDate, reason }
+    crow::response submitLeave (const crow::request& req) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isAuthenticated(token)) {
+            return crow::response(401, "{\"error\":\"Please log in first\"}");
+        }
+
+        int userId = getUserIdFromToken(req);
+        if (userId < 0) {
+            return crow::response(401, "{\"error\":\"Invalid token\"}");
+        }
+
+        try {
+            json body = json::parse(req.body);
+
+            string startDate = body.value("startDate", "");
+            string endDate   = body.value("endDate",   "");
+            string reason    = body.value("reason",    "");
+
+            if (startDate.empty() || endDate.empty()) {
+                return crow::response(400, "{\"error\":\"Start date and end date are required\"}");
+            }
+
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
 
             txn.exec_params(
-                "UPDATE leave_requests SET status=$1, reviewed_by=$2, reviewed_at=NOW() WHERE id=$3",
-                newStatus, ctx.userId, id
+                "INSERT INTO leave_requests (user_id, start_date, end_date, reason, status) "
+                "VALUES ($1, $2, $3, $4, 'pending')",
+                userId, startDate, endDate, reason
             );
 
-            if (action == "approve") {
-                // Deduct leave balance for annual/sick leave
-                if (leaveType == "annual" || leaveType == "sick") {
-                    txn.exec_params(
-                        "UPDATE employee_profiles SET "
-                        "leave_balance = leave_balance - ($1::date - $2::date + 1) "
-                        "WHERE user_id=$3 AND leave_balance > 0",
-                        endDate, startDate, employeeId
-                    );
-                }
-                // Remove conflicting draft shifts
-                markShiftsAsLeave(employeeId, startDate, endDate, txn);
+            txn.commit();
+            return crow::response(201, "{\"message\":\"Leave request submitted successfully\"}");
+
+        } catch (exception& e) {
+            cerr << "submitLeave error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
+        }
+    }
+
+    // ── PUT /api/leave/:id/approve ────────────
+    crow::response approveLeave (const crow::request& req, int leaveId) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isManager(token)) {
+            return crow::response(403, "{\"error\":\"Manager access required\"}");
+        }
+
+        try {
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
+
+            auto result = txn.exec_params(
+                "UPDATE leave_requests SET status = 'approved' "
+                "WHERE id = $1 RETURNING id",
+                leaveId
+            );
+
+            if (result.empty()) {
+                return crow::response(404, "{\"error\":\"Leave request not found\"}");
             }
 
             txn.commit();
+            return crow::response(200, "{\"message\":\"Leave request approved\"}");
 
-            json response = {
-                {"status",  newStatus},
-                {"message", "Leave request " + newStatus}
-            };
-
-            auto res = crow::response(200, response.dump());
-            res.set_header("Content-Type", "application/json");
-            return res;
-
-        } catch (const std::exception& e) {
-            std::cerr << "Review leave error: " << e.what() << std::endl;
-            return crow::response(500, R"({"error":"Internal server error"})");
+        } catch (exception& e) {
+            cerr << "approveLeave error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
         }
-    });
-}
+    }
+
+    // ── PUT /api/leave/:id/reject ─────────────
+    crow::response rejectLeave (const crow::request& req, int leaveId) {
+        string token = authMiddleware.extractToken(req);
+        if (!authMiddleware.isManager(token)) {
+            return crow::response(403, "{\"error\":\"Manager access required\"}");
+        }
+
+        try {
+            pqxx::connection conn(dbConnection);
+            pqxx::work txn(conn);
+
+            auto result = txn.exec_params(
+                "UPDATE leave_requests SET status = 'rejected' "
+                "WHERE id = $1 RETURNING id",
+                leaveId
+            );
+
+            if (result.empty()) {
+                return crow::response(404, "{\"error\":\"Leave request not found\"}");
+            }
+
+            txn.commit();
+            return crow::response(200, "{\"message\":\"Leave request rejected\"}");
+
+        } catch (exception& e) {
+            cerr << "rejectLeave error: " << e.what() << endl;
+            return crow::response(500, "{\"error\":\"Internal server error\"}");
+        }
+    }
+};

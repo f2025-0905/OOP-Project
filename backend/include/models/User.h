@@ -1,110 +1,63 @@
-#pragma once
+#ifndef USER_H
+#define USER_H
+
 #include <string>
-#include <nlohmann/json.hpp>
+using namespace std;
 
-using json = nlohmann::json;
-
-// ============================================
-// BASE CLASS: User
-// Demonstrates OOP: Encapsulation + Abstraction
-// ============================================
+// ─────────────────────────────────────────────
+//  User  —  stores one employee's account info
+// ─────────────────────────────────────────────
 class User {
-protected:
-    std::string id;
-    std::string username;
-    std::string email;
-    std::string passwordHash;
-    std::string firstName;
-    std::string lastName;
-    std::string role;
-    bool isActive;
-    std::string createdAt;
-
-public:
-    User() = default;
-    User(const std::string& id, const std::string& username,
-         const std::string& email, const std::string& firstName,
-         const std::string& lastName, const std::string& role);
-
-    virtual ~User() = default;
-
-    // Getters
-    std::string getId() const { return id; }
-    std::string getUsername() const { return username; }
-    std::string getEmail() const { return email; }
-    std::string getFirstName() const { return firstName; }
-    std::string getLastName() const { return lastName; }
-    std::string getRole() const { return role; }
-    std::string getFullName() const { return firstName + " " + lastName; }
-    bool getIsActive() const { return isActive; }
-
-    // Setters
-    void setPasswordHash(const std::string& hash) { passwordHash = hash; }
-    void setIsActive(bool active) { isActive = active; }
-    void setEmail(const std::string& e) { email = e; }
-
-    // Pure virtual: forces subclasses to implement
-    virtual json toJson() const = 0;
-    virtual std::string getPermissionLevel() const = 0;
-
-    // Static factory from DB row
-    static std::shared_ptr<User> fromRow(const pqxx::row& row);
-};
-
-// ============================================
-// DERIVED CLASS: Employee
-// Demonstrates OOP: Inheritance + Polymorphism
-// ============================================
-class Employee : public User {
 private:
-    std::string positionId;
-    std::string positionName;
-    int leaveBalance;
-    std::string phone;
-    std::string hireDate;
+    int    id;
+    string name;
+    string email;
+    string password;   // hashed password
+    string role;       // "manager" or "employee"
 
 public:
-    Employee() = default;
-    Employee(const std::string& id, const std::string& username,
-             const std::string& email, const std::string& firstName,
-             const std::string& lastName);
+    // Default constructor
+    User () {
+        id   = 0;
+        name = "";
+        email    = "";
+        password = "";
+        role     = "employee";
+    }
 
-    std::string getPositionId() const { return positionId; }
-    std::string getPositionName() const { return positionName; }
-    int getLeaveBalance() const { return leaveBalance; }
+    // Parameterized constructor
+    User (int userId, string userName, string userEmail,
+          string userPassword, string userRole) {
+        id       = userId;
+        name     = userName;
+        email    = userEmail;
+        password = userPassword;
+        role     = userRole;
+    }
 
-    void setPositionId(const std::string& pid) { positionId = pid; }
-    void setPositionName(const std::string& pname) { positionName = pname; }
-    void setLeaveBalance(int balance) { leaveBalance = balance; }
-    void setPhone(const std::string& p) { phone = p; }
-    void setHireDate(const std::string& d) { hireDate = d; }
+    // ── Getters ──────────────────────────────
+    int    getId ()       { return id; }
+    string getName ()     { return name; }
+    string getEmail ()    { return email; }
+    string getPassword () { return password; }
+    string getRole ()     { return role; }
 
-    bool deductLeave(int days);
-    void restoreLeave(int days) { leaveBalance += days; }
+    // ── Setters ──────────────────────────────
+    void setId (int userId)             { id       = userId; }
+    void setName (string userName)      { name     = userName; }
+    void setEmail (string userEmail)    { email    = userEmail; }
+    void setPassword (string pass)      { password = pass; }
+    void setRole (string userRole)      { role     = userRole; }
 
-    // Polymorphic override
-    json toJson() const override;
-    std::string getPermissionLevel() const override { return "standard"; }
+    // Convert object to JSON string (used by HTTP responses)
+    string toJson () {
+        return "{"
+               "\"id\":"     + to_string(id)   + ","
+               "\"name\":\""  + name            + "\","
+               "\"email\":\"" + email           + "\","
+               "\"role\":\""  + role            + "\""
+               "}";
+    }
 };
 
-// ============================================
-// DERIVED CLASS: Manager
-// Demonstrates OOP: Inheritance + Polymorphism
-// ============================================
-class Manager : public User {
-private:
-    std::string department;
-
-public:
-    Manager() = default;
-    Manager(const std::string& id, const std::string& username,
-            const std::string& email, const std::string& firstName,
-            const std::string& lastName);
-
-    std::string getDepartment() const { return department; }
-    void setDepartment(const std::string& dept) { department = dept; }
-
-    // Polymorphic override
-    json toJson() const override;
-    std::string getPermissionLevel() const override { return "admin"; }
-};
+#endif // USER_H

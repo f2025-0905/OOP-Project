@@ -1,150 +1,163 @@
 #include <crow.h>
-#include <pqxx/pqxx>
-#include <iostream>
 #include <cstdlib>
-#include "controllers/AuthController.h"
-#include "controllers/Controllers.h"
+#include <iostream>
+#include <string>
+using namespace std;
 
-int main() {
-    // ============================================
-    // Database connection
-    // ============================================
-    std::string dbUrl = std::getenv("DATABASE_URL") ? std::getenv("DATABASE_URL") : "";
+// Include all controllers
+#include "controllers/AuthController.cpp"
+#include "controllers/StaffController.cpp"
+#include "controllers/LeaveController.cpp"
+#include "controllers/ScheduleController.cpp"
+#include "controllers/DashboardController.cpp"
+
+// ─────────────────────────────────────────────
+//  main  —  starts the Crow HTTP server and
+//  registers every API route
+// ─────────────────────────────────────────────
+int main () {
+    // ── Read environment variables ────────────
+    // These are set in Render.com's dashboard (never hardcode secrets!)
+    string dbUrl    = getenv("DATABASE_URL") ? getenv("DATABASE_URL") : "";
+    string jwtSecret = getenv("JWT_SECRET")  ? getenv("JWT_SECRET")  : "default-secret";
+    string portStr  = getenv("PORT")         ? getenv("PORT")        : "8080";
+    int    port     = stoi(portStr);
+
     if (dbUrl.empty()) {
-        std::cerr << "ERROR: DATABASE_URL environment variable not set\n";
+        cerr << "ERROR: DATABASE_URL environment variable is not set." << endl;
         return 1;
     }
 
-    pqxx::connection db(dbUrl);
-    std::cout << "Connected to PostgreSQL\n";
+    cout << "Starting ShiftWise backend on port " << port << endl;
 
-    // ============================================
-    // Controllers (Dependency Injection via ref)
-    // ============================================
-    AuthController     authCtrl(db);
-    StaffController    staffCtrl(db);
-    ScheduleController scheduleCtrl(db);
-    LeaveController    leaveCtrl(db);
-    DashboardController dashCtrl(db);
+    // ── Create controller instances ───────────
+    // Each controller handles a group of related routes.
+    // We pass the DB connection string and JWT secret to every one.
+    AuthController     authCtrl    (dbUrl, jwtSecret);
+    StaffController    staffCtrl   (dbUrl, jwtSecret);
+    LeaveController    leaveCtrl   (dbUrl, jwtSecret);
+    ScheduleController schedCtrl   (dbUrl, jwtSecret);
+    DashboardController dashCtrl   (dbUrl, jwtSecret);
 
-    // ============================================
-    // Crow app
-    // ============================================
+    // ── Set up the web application ────────────
     crow::SimpleApp app;
 
-    // CORS middleware
-    auto& cors = app.get_middleware<crow::CORSHandler>();
-    cors.global()
-        .headers("Content-Type", "Authorization")
-        .methods("GET"_method, "POST"_method, "PUT"_method, "DELETE"_method, "OPTIONS"_method)
-        .origin("*");
+    // CORS middleware — needed so the React frontend can talk to this server
+    app.before_handle([](crow::request& req, crow::response& res, crow::App<>::context&) {
+        res.add_header("Access-Control-Allow-Origin",  "*");
+        res.add_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+        res.add_header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        if (req.method == crow::HTTPMethod::Options) {
+            res.code = 204;
+            res.end();
+        }
+    });
 
-    // ============================================
-    // AUTH ROUTES
-    // ============================================
-    CROW_ROUTE(app, "/api/auth/login").methods("POST"_method)(
-        [&](const crow::request& req) { return authCtrl.login(req); });
+    // ── Auth routes ───────────────────────────
+    CROW_ROUTE(app, "/api/auth/signup").methods("POST"_method)
+    ([&authCtrl](const crow::request& req) {
+        return authCtrl.signup(req);
+    });
 
-    CROW_ROUTE(app, "/api/auth/signup").methods("POST"_method)(
-        [&](const crow::request& req) { return authCtrl.signup(req); });
+    CROW_ROUTE(app, "/api/auth/login").methods("POST"_method)
+    ([&authCtrl](const crow::request& req) {
+        return authCtrl.login(req);
+    });
 
-    CROW_ROUTE(app, "/api/auth/me").methods("GET"_method)(
-        [&](const crow::request& req) { return authCtrl.getMe(req); });
+    // ── Staff routes ──────────────────────────
+    CROW_ROUTE(app, "/api/staff").methods("GET"_method)
+    ([&staffCtrl](const crow::request& req) {
+        return staffCtrl.getAllStaff(req);
+    });
 
-    CROW_ROUTE(app, "/api/auth/change-password").methods("POST"_method)(
-        [&](const crow::request& req) { return authCtrl.changePassword(req); });
+    CROW_ROUTE(app, "/api/staff/<int>").methods("GET"_method)
+    ([&staffCtrl](const crow::request& req, int id) {
+        return staffCtrl.getStaffById(req, id);
+    });
 
-    // ============================================
-    // STAFF ROUTES
-    // ============================================
-    CROW_ROUTE(app, "/api/staff").methods("GET"_method)(
-        [&](const crow::request& req) { return staffCtrl.getAllEmployees(req); });
+    CROW_ROUTE(app, "/api/staff/<int>").methods("PUT"_method)
+    ([&staffCtrl](const crow::request& req, int id) {
+        return staffCtrl.updateStaff(req, id);
+    });
 
-    CROW_ROUTE(app, "/api/staff").methods("POST"_method)(
-        [&](const crow::request& req) { return staffCtrl.createEmployee(req); });
+    CROW_ROUTE(app, "/api/staff/<int>").methods("DELETE"_method)
+    ([&staffCtrl](const crow::request& req, int id) {
+        return staffCtrl.deleteStaff(req, id);
+    });
 
-    CROW_ROUTE(app, "/api/staff/<string>").methods("PUT"_method)(
-        [&](const crow::request& req, std::string id) { return staffCtrl.updateEmployee(req, id); });
+    // ── Leave routes ──────────────────────────
+    CROW_ROUTE(app, "/api/leave").methods("GET"_method)
+    ([&leaveCtrl](const crow::request& req) {
+        return leaveCtrl.getAllLeave(req);
+    });
 
-    CROW_ROUTE(app, "/api/staff/<string>").methods("DELETE"_method)(
-        [&](const crow::request& req, std::string id) { return staffCtrl.deleteEmployee(req, id); });
+    CROW_ROUTE(app, "/api/leave/my").methods("GET"_method)
+    ([&leaveCtrl](const crow::request& req) {
+        return leaveCtrl.getMyLeave(req);
+    });
 
-    CROW_ROUTE(app, "/api/staff/<string>/position").methods("PUT"_method)(
-        [&](const crow::request& req, std::string id) { return staffCtrl.assignPosition(req, id); });
+    CROW_ROUTE(app, "/api/leave").methods("POST"_method)
+    ([&leaveCtrl](const crow::request& req) {
+        return leaveCtrl.submitLeave(req);
+    });
 
-    // POSITION ROUTES
-    CROW_ROUTE(app, "/api/positions").methods("GET"_method)(
-        [&](const crow::request& req) { return staffCtrl.getAllPositions(req); });
+    CROW_ROUTE(app, "/api/leave/<int>/approve").methods("PUT"_method)
+    ([&leaveCtrl](const crow::request& req, int id) {
+        return leaveCtrl.approveLeave(req, id);
+    });
 
-    CROW_ROUTE(app, "/api/positions").methods("POST"_method)(
-        [&](const crow::request& req) { return staffCtrl.createPosition(req); });
+    CROW_ROUTE(app, "/api/leave/<int>/reject").methods("PUT"_method)
+    ([&leaveCtrl](const crow::request& req, int id) {
+        return leaveCtrl.rejectLeave(req, id);
+    });
 
-    CROW_ROUTE(app, "/api/positions/<string>").methods("DELETE"_method)(
-        [&](const crow::request& req, std::string id) { return staffCtrl.deletePosition(req, id); });
+    // ── Schedule routes ───────────────────────
+    CROW_ROUTE(app, "/api/schedule").methods("GET"_method)
+    ([&schedCtrl](const crow::request& req) {
+        return schedCtrl.getAllShifts(req);
+    });
 
-    // ============================================
-    // SCHEDULE ROUTES
-    // ============================================
-    CROW_ROUTE(app, "/api/schedule").methods("GET"_method)(
-        [&](const crow::request& req) { return scheduleCtrl.getWeeklySchedule(req); });
+    CROW_ROUTE(app, "/api/schedule/my").methods("GET"_method)
+    ([&schedCtrl](const crow::request& req) {
+        return schedCtrl.getMyShifts(req);
+    });
 
-    CROW_ROUTE(app, "/api/schedule/my").methods("GET"_method)(
-        [&](const crow::request& req) { return scheduleCtrl.getMyShifts(req); });
+    CROW_ROUTE(app, "/api/schedule").methods("POST"_method)
+    ([&schedCtrl](const crow::request& req) {
+        return schedCtrl.createShift(req);
+    });
 
-    CROW_ROUTE(app, "/api/schedule/shift").methods("POST"_method)(
-        [&](const crow::request& req) { return scheduleCtrl.createShift(req); });
+    CROW_ROUTE(app, "/api/schedule/<int>").methods("PUT"_method)
+    ([&schedCtrl](const crow::request& req, int id) {
+        return schedCtrl.updateShift(req, id);
+    });
 
-    CROW_ROUTE(app, "/api/schedule/shift/<string>").methods("PUT"_method)(
-        [&](const crow::request& req, std::string id) { return scheduleCtrl.updateShift(req, id); });
+    CROW_ROUTE(app, "/api/schedule/<int>").methods("DELETE"_method)
+    ([&schedCtrl](const crow::request& req, int id) {
+        return schedCtrl.deleteShift(req, id);
+    });
 
-    CROW_ROUTE(app, "/api/schedule/shift/<string>").methods("DELETE"_method)(
-        [&](const crow::request& req, std::string id) { return scheduleCtrl.deleteShift(req, id); });
+    // ── Dashboard routes ──────────────────────
+    CROW_ROUTE(app, "/api/dashboard/stats").methods("GET"_method)
+    ([&dashCtrl](const crow::request& req) {
+        return dashCtrl.getManagerStats(req);
+    });
 
-    CROW_ROUTE(app, "/api/schedule/publish").methods("POST"_method)(
-        [&](const crow::request& req) { return scheduleCtrl.publishShifts(req); });
+    CROW_ROUTE(app, "/api/dashboard/my").methods("GET"_method)
+    ([&dashCtrl](const crow::request& req) {
+        return dashCtrl.getEmployeeStats(req);
+    });
 
-    // ============================================
-    // LEAVE ROUTES
-    // ============================================
-    CROW_ROUTE(app, "/api/leave").methods("POST"_method)(
-        [&](const crow::request& req) { return leaveCtrl.applyLeave(req); });
+    // Health-check route (Render pings this to confirm the server is alive)
+    CROW_ROUTE(app, "/health")
+    ([]() {
+        return crow::response(200, "{\"status\":\"ok\"}");
+    });
 
-    CROW_ROUTE(app, "/api/leave/my").methods("GET"_method)(
-        [&](const crow::request& req) { return leaveCtrl.getMyLeaves(req); });
-
-    CROW_ROUTE(app, "/api/leave").methods("GET"_method)(
-        [&](const crow::request& req) { return leaveCtrl.getAllLeaves(req); });
-
-    CROW_ROUTE(app, "/api/leave/<string>/review").methods("PUT"_method)(
-        [&](const crow::request& req, std::string id) { return leaveCtrl.reviewLeave(req, id); });
-
-    // ============================================
-    // DASHBOARD ROUTES
-    // ============================================
-    CROW_ROUTE(app, "/api/dashboard/manager").methods("GET"_method)(
-        [&](const crow::request& req) { return dashCtrl.getManagerDashboard(req); });
-
-    CROW_ROUTE(app, "/api/dashboard/employee").methods("GET"_method)(
-        [&](const crow::request& req) { return dashCtrl.getEmployeeDashboard(req); });
-
-    CROW_ROUTE(app, "/api/announcements").methods("GET"_method)(
-        [&](const crow::request& req) { return dashCtrl.getAnnouncements(req); });
-
-    CROW_ROUTE(app, "/api/announcements").methods("POST"_method)(
-        [&](const crow::request& req) { return dashCtrl.createAnnouncement(req); });
-
-    CROW_ROUTE(app, "/api/announcements/<string>").methods("DELETE"_method)(
-        [&](const crow::request& req, std::string id) { return dashCtrl.deleteAnnouncement(req, id); });
-
-    // Health check
-    CROW_ROUTE(app, "/health")([](){ return crow::response(200, R"({"status":"ok"})"); });
-
-    // ============================================
-    // Start server
-    // ============================================
-    int port = std::getenv("PORT") ? std::stoi(std::getenv("PORT")) : 8080;
-    std::cout << "ShiftWise backend running on port " << port << "\n";
-    app.port(port).multithreaded().run();
+    // ── Start the server ──────────────────────
+    app.port(port)
+       .multithreaded()
+       .run();
 
     return 0;
 }
